@@ -10,6 +10,7 @@ import (
 func newTestModelRegistry() *ModelRegistry {
 	return &ModelRegistry{
 		models:           make(map[string]*ModelRegistration),
+		modelsByLowerID:  make(map[string]string),
 		clientModels:     make(map[string][]string),
 		clientModelInfos: make(map[string]map[string]*ModelInfo),
 		clientProviders:  make(map[string]string),
