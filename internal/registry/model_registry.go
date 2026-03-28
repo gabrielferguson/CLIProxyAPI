@@ -112,6 +112,10 @@ type ModelRegistryHook interface {
 type ModelRegistry struct {
 	// models maps model ID to registration information
 	models map[string]*ModelRegistration
+	// modelsByLowerID maps lowercase model IDs to their canonical (original-case) registered IDs.
+	// This secondary index enables case-insensitive lookups so that requests using lowercase
+	// canonical IDs (e.g. "gpt-5.4") can match models registered with display-case IDs (e.g. "GPT-5.4").
+	modelsByLowerID map[string]string
 	// clientModels maps client ID to the models it provides
 	clientModels map[string][]string
 	// clientModelInfos maps client ID to a map of model ID -> ModelInfo
@@ -136,6 +140,7 @@ func GetGlobalRegistry() *ModelRegistry {
 	registryOnce.Do(func() {
 		globalRegistry = &ModelRegistry{
 			models:               make(map[string]*ModelRegistration),
+			modelsByLowerID:      make(map[string]string),
 			clientModels:         make(map[string][]string),
 			clientModelInfos:     make(map[string]map[string]*ModelInfo),
 			clientProviders:      make(map[string]string),
@@ -444,6 +449,26 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	misc.LogCredentialSeparator()
 }
 
+// lookupModelKeyLocked returns the canonical registered model key for the given modelID.
+// It first tries an exact match, then falls back to a case-insensitive match via
+// the modelsByLowerID index. Must be called with at least a read lock held.
+func (r *ModelRegistry) lookupModelKeyLocked(modelID string) string {
+	if _, ok := r.models[modelID]; ok {
+		return modelID
+	}
+	if r.modelsByLowerID != nil {
+		if canonical, ok := r.modelsByLowerID[strings.ToLower(modelID)]; ok {
+			// Double-check that the canonical entry still exists in r.models.
+			// modelsByLowerID may contain stale entries if a model was removed via
+			// a code path that did not clean up the index (defensive guard).
+			if _, ok := r.models[canonical]; ok {
+				return canonical
+			}
+		}
+	}
+	return modelID
+}
+
 func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *ModelInfo, now time.Time) {
 	if model == nil || modelID == "" {
 		return
@@ -482,6 +507,12 @@ func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *Mo
 		registration.InfoByProvider[provider] = cloneModelInfo(model)
 	}
 	r.models[modelID] = registration
+	if r.modelsByLowerID != nil {
+		lower := strings.ToLower(modelID)
+		if _, exists := r.modelsByLowerID[lower]; !exists {
+			r.modelsByLowerID[lower] = modelID
+		}
+	}
 	log.Debugf("Registered new model %s from provider %s", modelID, provider)
 }
 
@@ -516,6 +547,12 @@ func (r *ModelRegistry) removeModelRegistration(clientID, modelID, provider stri
 	log.Debugf("Decremented count for model %s, now %d clients", modelID, registration.Count)
 	if registration.Count <= 0 {
 		delete(r.models, modelID)
+		if r.modelsByLowerID != nil {
+			lower := strings.ToLower(modelID)
+			if canonical, ok := r.modelsByLowerID[lower]; ok && canonical == modelID {
+				delete(r.modelsByLowerID, lower)
+			}
+		}
 		log.Debugf("Removed model %s as no clients remain", modelID)
 	}
 }
@@ -617,6 +654,12 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 			// Remove model if no clients remain
 			if registration.Count <= 0 {
 				delete(r.models, modelID)
+				if r.modelsByLowerID != nil {
+					lower := strings.ToLower(modelID)
+					if canonical, ok := r.modelsByLowerID[lower]; ok && canonical == modelID {
+						delete(r.modelsByLowerID, lower)
+					}
+				}
 				log.Debugf("Removed model %s as no clients remain", modelID)
 			}
 		}
@@ -1003,7 +1046,7 @@ func (r *ModelRegistry) GetModelCount(modelID string) int {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
-	if registration, exists := r.models[modelID]; exists {
+	if registration, exists := r.models[r.lookupModelKeyLocked(modelID)]; exists {
 		now := time.Now()
 
 		// Count clients that have exceeded quota but haven't recovered yet
@@ -1036,7 +1079,7 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
-	registration, exists := r.models[modelID]
+	registration, exists := r.models[r.lookupModelKeyLocked(modelID)]
 	if !exists || registration == nil || len(registration.Providers) == 0 {
 		return nil
 	}
@@ -1087,7 +1130,7 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 func (r *ModelRegistry) GetModelInfo(modelID, provider string) *ModelInfo {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
-	if reg, ok := r.models[modelID]; ok && reg != nil {
+	if reg, ok := r.models[r.lookupModelKeyLocked(modelID)]; ok && reg != nil {
 		// Try provider specific definition first
 		if provider != "" && reg.InfoByProvider != nil {
 			if reg.Providers != nil {
